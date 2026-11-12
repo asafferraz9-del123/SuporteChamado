@@ -1,133 +1,263 @@
-// server.js - API REST Completa (CRUD) do Sistema de Chamados
-
-const express = require('express');
-const cors = require('cors');
+// server.js - API REST com Autenticação e Proteção de Rotas
+const express = require("express");
+const cors = require("cors");
+const mysql = require("mysql2/promise");
+const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
+const supabase = require("./supabase");
+require("dotenv").config();
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+const JWT_SECRET = process.env.JWT_SECRET || "chave_secreta_padrao";
 
-// Middlewares
 app.use(cors());
-app.use(express.json()); // OBRIGATÓRIO: permite ler dados JSON no req.body
-
-// Banco de dados em memória (simulado)
-let chamados = [
-  {
-    id: 101,
-    titulo: 'Impressora do setor financeiro não responde',
-    descricao: 'Erro de comunicação de rede no 2º andar.',
-    prioridade: 'Alta',
-    status: 'Aberto',
-    data: '2026-11-14'
-  },
-  {
-    id: 102,
-    titulo: 'Computador travando ao iniciar o sistema',
-    descricao: 'Lentidão recorrente no setor de RH.',
-    prioridade: 'Média',
-    status: 'Em Andamento',
-    data: '2026-11-14'
-  }
-];
+app.use(express.json());
 
 // ============================================================================
-// ROTAS DA API REST (CRUD)
+// MIDDLEWARE DE AUTENTICAÇÃO (O "Segurança" da Festa)
 // ============================================================================
+function autenticarToken(req, res, next) {
+  // Captura o cabeçalho Authorization enviado pelo cliente
+  const authHeader = req.headers["authorization"];
+  const token = authHeader && authHeader.split(" ")[1]; // Formato: "Bearer TOKEN"
 
-// 1. HEALTH CHECK (GET)
-app.get('/', (req, res) => {
-  res.send('API do Sistema de Chamados de Suporte Técnico rodando!');
-});
-
-// 2. READ ALL (GET) - Listar chamados
-app.get('/api/chamados', (req, res) => {
-  res.status(200).json(chamados);
-});
-
-// 3. READ ONE (GET) - Consultar chamado por ID
-app.get('/api/chamados/:id', (req, res) => {
-  const idBusca = parseInt(req.params.id);
-  const chamado = chamados.find((c) => c.id === idBusca);
-
-  if (!chamado) {
-    return res.status(404).json({ erro: 'Chamado não encontrado.' });
+  if (!token) {
+    return res
+      .status(401)
+      .json({ erro: "Acesso negado. Token não fornecido!" });
   }
 
-  res.status(200).json(chamado);
+  // Verifica se o token é válido e não expirou
+  jwt.verify(token, JWT_SECRET, (err, usuarioDecodificado) => {
+    if (err) {
+      return res.status(403).json({ erro: "Token inválido ou expirado!" });
+    }
+
+    // Salva os dados do usuário na requisição para uso posterior
+    req.usuario = usuarioDecodificado;
+    next(); // Libera a requisição para continuar para a rota
+  });
+}
+
+// ============================================================================
+// ROTAS DE AUTENTICAÇÃO (PÚBLICAS)
+// ============================================================================
+
+// 1. CADASTRAR NOVO USUÁRIO (POST /api/auth/cadastrar)
+app.post("/api/auth/cadastrar", async (req, res) => {
+  const { nome, email, senha } = req.body;
+
+  if (!nome || !email || !senha) {
+    return res
+      .status(400)
+      .json({ erro: "Nome, e-mail e senha são obrigatórios." });
+  }
+
+  try {
+    // Criptografa a senha antes de salvar no Supabase (Hash)
+    const senhaHash = await bcrypt.hash(senha, 10);
+
+    const { data, error } = await supabase
+      .from("usuarios")
+      .insert([{ nome, email, senha: senhaHash }])
+      .select();
+
+    if (error) {
+      return res
+        .status(400)
+        .json({ erro: "E-mail já cadastrado ou erro no banco." });
+    }
+
+    res.status(201).json({
+      mensagem: "Usuário cadastrado com sucesso!",
+      usuario: { id: data[0].id, nome: data[0].nome, email: data[0].email },
+    });
+  } catch (err) {
+    res.status(500).json({ erro: "Erro interno ao cadastrar usuário." });
+  }
 });
 
-// 4. CREATE (POST) - Cadastrar novo chamado
-app.post('/api/chamados', (req, res) => {
+// 2. LOGIN DE USUÁRIO (POST /api/auth/login)
+app.post("/api/auth/login", async (req, res) => {
+  const { email, senha } = req.body;
+
+  if (!email || !senha) {
+    return res.status(400).json({ erro: "E-mail e senha são obrigatórios." });
+  }
+
+  // Busca o usuário no Supabase pelo e-mail
+  const { data: usuario, error } = await supabase
+    .from("usuarios")
+    .select("*")
+    .eq("email", email)
+    .single();
+
+  if (error || !usuario) {
+    return res.status(401).json({ erro: "E-mail ou senha incorretos." });
+  }
+
+  // Compara a senha digitada com o Hash salvo no banco
+  const senhaValida = await bcrypt.compare(senha, usuario.senha);
+
+  if (!senhaValida) {
+    return res.status(401).json({ erro: "E-mail ou senha incorretos." });
+  }
+
+  // Gera o Token JWT assinado (válido por 8 horas)
+  const token = jwt.sign(
+    { id: usuario.id, nome: usuario.nome, email: usuario.email },
+    JWT_SECRET,
+    { expiresIn: "8h" },
+  );
+
+  res.status(200).json({
+    mensagem: "Login realizado com sucesso!",
+    token,
+    usuario: { id: usuario.id, nome: usuario.nome, email: usuario.email },
+  });
+});
+
+// ============================================================================
+// ROTAS DE CHAMADOS (ALGUMAS PROTEGIDAS POR TOKEN)
+// ============================================================================
+
+// Listar chamados (Pública)
+app.get("/api/chamados", async (req, res) => {
+  const { data, error } = await supabase
+    .from("chamados")
+    .select("*")
+    .order("id", { ascending: false });
+
+  if (error) return res.status(500).json({ erro: error.message });
+  res.status(200).json(data);
+});
+
+// Criar chamado (PROTEGIDA: exige que o usuário esteja logado!)
+app.post("/api/chamados", autenticarToken, async (req, res) => {
   const { titulo, descricao, prioridade } = req.body;
 
-  // Validação simples de campos obrigatórios
   if (!titulo || !descricao) {
-    return res.status(400).json({ 
-      erro: 'Título e descrição são campos obrigatórios.' 
-    });
+    return res
+      .status(400)
+      .json({ erro: "Título e descrição são obrigatórios." });
   }
 
-  // Cria o novo chamado
   const novoChamado = {
-    id: Date.now(), // Gera ID único temporário
     titulo,
     descricao,
-    prioridade: prioridade || 'Baixa',
-    status: 'Aberto',
-    data: new Date().toISOString().split('T')[0]
+    prioridade: prioridade || "Baixa",
+    status: "Aberto",
+    data: new Date().toISOString().split("T")[0],
+    usuario_id: req.usuario.id, // Pega o ID diretamente do token validado!
   };
 
-  chamados.push(novoChamado);
+  const { data, error } = await supabase
+    .from("chamados")
+    .insert([novoChamado])
+    .select();
 
-  // Retorna status 201 Created com o objeto criado
-  res.status(201).json(novoChamado);
+  if (error) return res.status(500).json({ erro: error.message });
+  res.status(201).json(data[0]);
 });
 
-// 5. UPDATE (PUT) - Atualizar um chamado existente
-app.put('/api/chamados/:id', (req, res) => {
-  const idBusca = parseInt(req.params.id);
-  const index = chamados.findIndex((c) => c.id === idBusca);
+// Excluir chamado (PROTEGIDA)
+app.delete("/api/chamados/:id", autenticarToken, async (req, res) => {
+  const { id } = req.params;
 
-  if (index === -1) {
-    return res.status(404).json({ erro: 'Chamado não encontrado para atualização.' });
-  }
+  const { error } = await supabase.from("chamados").delete().eq("id", id);
 
-  // Atualiza os dados mantendo o ID original
-  const { titulo, descricao, prioridade, status } = req.body;
-
-  chamados[index] = {
-    ...chamados[index],
-    titulo: titulo || chamados[index].titulo,
-    descricao: descricao || chamados[index].descricao,
-    prioridade: prioridade || chamados[index].prioridade,
-    status: status || chamados[index].status
-  };
-
-  res.status(200).json({
-    mensagem: 'Chamado atualizado com sucesso!',
-    chamado: chamados[index]
-  });
+  if (error) return res.status(500).json({ erro: error.message });
+  res.status(200).json({ mensagem: "Chamado excluído com sucesso!" });
 });
 
-// 6. DELETE (DELETE) - Excluir um chamado por ID
-app.delete('/api/chamados/:id', (req, res) => {
-  const idBusca = parseInt(req.params.id);
-  const index = chamados.findIndex((c) => c.id === idBusca);
-
-  if (index === -1) {
-    return res.status(404).json({ erro: 'Chamado não encontrado para exclusão.' });
-  }
-
-  // Remove o chamado do array
-  const chamadoRemovido = chamados.splice(index, 1);
-
-  res.status(200).json({
-    mensagem: 'Chamado excluído com sucesso!',
-    chamado: chamadoRemovido[0]
-  });
-});
-
-// Inicialização do Servidor
 app.listen(PORT, () => {
-  console.log(`🚀 Servidor rodando na porta http://localhost:${PORT}`);
+  console.log(
+    `🚀 Servidor com Autenticação JWT rodando em: http://localhost:${PORT}`,
+  );
+});
+
+// 1. ROTA GET (Para listar os chamados do MariaDB)
+app.get("/api/mariadb/chamados", async (req, res) => {
+  try {
+    const conexao = await mysql.createConnection({
+      host: "localhost",
+      user: "root",
+      password: "idep@123",
+      database: "bd_chamados",
+    });
+
+    const [linhas] = await conexao.query(
+      "SELECT * FROM chamados ORDER BY id DESC",
+    );
+    await conexao.end();
+
+    res.status(200).json(linhas);
+  } catch (erro) {
+    res.status(500).json({ erro: erro.message });
+  }
+});
+
+// 1. ROTA GET (Para listar os chamados do MariaDB)
+app.get("/api/mariadb/chamados", async (req, res) => {
+  try {
+    const conexao = await mysql.createConnection({
+      host: "localhost",
+      user: "root",
+      password: "idep@123",
+      database: "bd_chamados",
+    });
+
+    const [linhas] = await conexao.query(
+      "SELECT * FROM chamados ORDER BY id DESC",
+    );
+    await conexao.end();
+
+    res.status(200).json(linhas);
+  } catch (erro) {
+    res.status(500).json({ erro: erro.message });
+  }
+});
+
+// 2. ROTA POST (Para CADASTRAR novo chamado no MariaDB)
+app.post("/api/mariadb/chamados", async (req, res) => {
+  try {
+    const { titulo, descricao, prioridade, usuario_id } = req.body;
+
+    if (!titulo || !descricao) {
+      return res
+        .status(400)
+        .json({ erro: "Título e descrição são obrigatórios." });
+    }
+
+    const conexao = await mysql.createConnection({
+      host: "localhost",
+      user: "root",
+      password: "idep@123",
+      database: "bd_chamados",
+    });
+
+    const dataAtual = new Date().toISOString().split("T")[0];
+
+    const [resultado] = await conexao.query(
+      "INSERT INTO chamados (titulo, descricao, prioridade, status, data, usuario_id) VALUES (?, ?, ?, ?, ?, ?)",
+      [
+        titulo,
+        descricao,
+        prioridade || "Baixa",
+        "Aberto",
+        dataAtual,
+        usuario_id || 1,
+      ],
+    );
+
+    await conexao.end();
+
+    res.status(201).json({
+      mensagem: "Chamado cadastrado no MariaDB com sucesso!",
+      id_gerado: resultado.insertId,
+    });
+  } catch (erro) {
+    res.status(500).json({ erro: erro.message });
+  }
 });
